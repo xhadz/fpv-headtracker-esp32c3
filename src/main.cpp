@@ -19,6 +19,7 @@
 #include <math.h>
 #include "application.h"
 #include "types.h"
+#include "../uv.lock/lock.h"   // Private secrets — not committed to git
 
 // ======================================================
 // 2. Platform Selection (ESP32 / ESP8266)
@@ -44,16 +45,16 @@ enum RadioMode
 // 3. Configuration (Defines, UID, WiFi, Logging)
 // ======================================================
 
-
-uint8_t UID[6] = {0,0,0,0,0,0};   // remplace par ton UID (web-flasher)
+// TON UID — value defined in uv.lock/lock.h (not committed)
+uint8_t UID[6] = SECRET_UID_BYTES;
 
 RadioMode radioMode = MODE_BOTH;
 
 const unsigned long CONFIG_WINDOW_MS = 5000;
 
-// ===== AP Wifi Config =====
-const char* ssid = "Backpack_ELRS_Crsf";
-const char* password = "12345678";
+// ===== AP Wifi Config — values defined in uv.lock/lock.h (not committed) =====
+const char* ssid     = SECRET_WIFI_SSID;
+const char* password = SECRET_WIFI_PASSWORD;
 
 // ===== Config for Channel output =====
 const uint8_t NUM_CHANNELS = 16;
@@ -63,11 +64,16 @@ const uint8_t NUM_CHANNELS = 16;
 float wavePhase = 0.0;
 #define STEP_INTERVAL 100
 
-// ===== Limite de plage de tete (degres de chaque cote) =====
-#define HT_LIMIT_DEG 100.0f
+// ===== Reglages head tracking =====
+#define HT_LIMIT_DEG   100.0f   // plage de tete +/- (degres)
+#define PAN_GAIN       1.0f     // sensibilite pan  (1.0 = normal, >1 plus sensible)
+#define TILT_GAIN      1.0f     // sensibilite tilt
+#define PAN_REVERSE    false    // inverse le sens du pan
+#define TILT_REVERSE   false    // inverse le sens du tilt
 
-// ===== Bouton de recentrage =====
-#define RECENTER_PIN 3      // poussoir entre GPIO3 et GND
+// ===== Bouton (recentrage = appui court, hold = appui long) =====
+#define RECENTER_PIN   3        // poussoir entre GPIO3 et GND
+#define LONGPRESS_MS   500      // duree pour declencher le hold
 
 // ======================================================
 // BNO085 Head Tracking  (broches C3 : SDA=8, SCL=9)
@@ -83,6 +89,10 @@ sh2_SensorValue_t htEvent;
 // Quaternion de reference (le "centre" capture au recentrage)
 float refQr = 1, refQi = 0, refQj = 0, refQk = 0;
 bool haveRef = false;
+
+// Etat hold
+bool holdActive = false;
+float holdPan = 0, holdTilt = 0;   // valeurs figees pendant le hold (en degres)
 
 void initBNO085() {
     Wire.begin(SDA_PIN, SCL_PIN);
@@ -100,6 +110,13 @@ void initBNO085() {
     } else {
         LOG_ERROR("BNO085 absent - on continue sans");
     }
+}
+
+// Normalise un angle dans [-180, 180] en gerant le wrap-around
+float normalizeAngle(float deg) {
+    while (deg > 180.0f)  deg -= 360.0f;
+    while (deg < -180.0f) deg += 360.0f;
+    return deg;
 }
 
 uint16_t angleToChannel(float deg) {
@@ -279,7 +296,7 @@ void initInfo()
 
 void setup() {
     initSerial();
-    pinMode(RECENTER_PIN, INPUT_PULLUP);   // bouton de recentrage
+    pinMode(RECENTER_PIN, INPUT_PULLUP);
     initBNO085();
     delay(3000);
     initWiFi();
@@ -303,6 +320,49 @@ void quatMul(float aw,float ax,float ay,float az,
     ox = aw*bx + ax*bw + ay*bz - az*by;
     oy = aw*by - ax*bz + ay*bw + az*bx;
     oz = aw*bz + ax*by - ay*bx + az*bw;
+}
+
+// ======================================================
+// Extraction Pan / Tilt depuis un quaternion relatif
+// Choisir la methode ici :
+//   0 = LOOK_VECTOR  (simple, coupling aux grands angles)
+//   1 = EULER_ZYX    (decouple, recommande)
+// ======================================================
+#define PAN_TILT_METHOD 1
+
+// Methode 0 : vecteur regard (Z forward) -> spherique monde
+// Simple mais pan/tilt se contaminent mutuellement aux grands angles.
+void extractPanTilt_LookVector(float rw, float rx, float ry, float rz,
+                               float &pan, float &tilt) {
+    const float R2D = 57.29578f;
+    float vx = 2.0f*(rx*rz + rw*ry);
+    float vy = 2.0f*(ry*rz - rw*rx);
+    float vz = 1.0f - 2.0f*(rx*rx + ry*ry);
+    pan  = asinf(constrain(vx, -1.0f, 1.0f)) * R2D;
+    tilt = atan2f(vy, sqrtf(vx*vx + vz*vz)) * R2D;
+}
+
+// Methode 1 : Euler ZYX intrinseque (yaw=pan, pitch=tilt)
+// Pan et tilt sont extraits dans le repere propre de la tete
+// -> pas de contamination croisee aux grands angles.
+void extractPanTilt_EulerZYX(float rw, float rx, float ry, float rz,
+                              float &pan, float &tilt) {
+    const float R2D = 57.29578f;
+    float sinPan = 2.0f*(rw*rz + rx*ry);
+    float cosPan = 1.0f - 2.0f*(ry*ry + rz*rz);
+    pan  = atan2f(sinPan, cosPan) * R2D;
+    float sinTilt = 2.0f*(rw*ry - rz*rx);
+    tilt = asinf(constrain(sinTilt, -1.0f, 1.0f)) * R2D;
+}
+
+// Dispatcher — appelle la methode choisie par PAN_TILT_METHOD
+void extractPanTilt(float rw, float rx, float ry, float rz,
+                    float &pan, float &tilt) {
+#if PAN_TILT_METHOD == 0
+    extractPanTilt_LookVector(rw, rx, ry, rz, pan, tilt);
+#else
+    extractPanTilt_EulerZYX(rw, rx, ry, rz, pan, tilt);
+#endif
 }
 
 void loop()
@@ -357,6 +417,7 @@ void loop()
         static uint16_t tiltCh = (CHANNEL_MIN + CHANNEL_MAX) / 2;
 
         static float lastQr = 1, lastQi = 0, lastQj = 0, lastQk = 0;
+        static float curPan = 0, curTilt = 0;   // angles courants (degres)
 
         if (bno.getSensorEvent(&htEvent) &&
             htEvent.sensorId == SH2_ARVR_STABILIZED_RV)
@@ -366,10 +427,8 @@ void loop()
             float qj = htEvent.un.arvrStabilizedRV.j;
             float qk = htEvent.un.arvrStabilizedRV.k;
 
-            // memorise le dernier quaternion brut (pour le recentrage)
             lastQr = qr; lastQi = qi; lastQj = qj; lastQk = qk;
 
-            // Si pas encore de reference, on prend la premiere mesure comme centre
             if (!haveRef) {
                 refQr = qr; refQi = qi; refQj = qj; refQk = qk;
                 haveRef = true;
@@ -381,34 +440,52 @@ void loop()
                     qr, qi, qj, qk,
                     rw, rx, ry, rz);
 
-            // ---- Methode "vecteur regard" : decouple pan et tilt ----
-            // On fait tourner le vecteur "avant" (0,0,1) par le quaternion relatif.
-            // Le vecteur resultant (vx,vy,vz) pointe ou regarde la tete.
-            float vx = 2*(rx*rz + rw*ry);
-            float vy = 2*(ry*rz - rw*rx);
-            float vz = 1 - 2*(rx*rx + ry*ry);
-
-            const float R2D = 57.29578f;
-            // pan  = azimut horizontal (gauche/droite)
-            float pan  = asinf(vx) * R2D;
-            // tilt = elevation verticale (haut/bas)
-            float tilt = atan2f(vy, sqrtf(vx*vx + vz*vz)) * R2D;
-
-            panCh  = angleToChannel(pan);
-            tiltCh = angleToChannel(tilt);
+            extractPanTilt(rw, rx, ry, rz, curPan, curTilt);
         }
 
-        // ---- Bouton de recentrage (GPIO3, actif LOW) ----
+        // ---- Gestion bouton : court = recentrage, long = hold ----
         static bool lastBtn = HIGH;
-        static uint32_t lastBtnTime = 0;
+        static uint32_t pressStart = 0;
+        static bool longFired = false;
         bool btn = digitalRead(RECENTER_PIN);
-        if (lastBtn == HIGH && btn == LOW && (millis() - lastBtnTime > 300)) {
-            refQr = lastQr; refQi = lastQi; refQj = lastQj; refQk = lastQk;
-            haveRef = true;
-            lastBtnTime = millis();
-            LOG_INFO("Recentre !");
+
+        if (lastBtn == HIGH && btn == LOW) {
+            // debut d'appui
+            pressStart = millis();
+            longFired = false;
+        }
+        if (btn == LOW && !longFired && (millis() - pressStart >= LONGPRESS_MS)) {
+            // appui long atteint -> bascule HOLD
+            longFired = true;
+            holdActive = !holdActive;
+            if (holdActive) {
+                holdPan = curPan; holdTilt = curTilt;   // fige la position actuelle
+                LOG_INFO("HOLD ON");
+            } else {
+                LOG_INFO("HOLD OFF");
+            }
+        }
+        if (lastBtn == LOW && btn == HIGH) {
+            // relachement : si c'etait un appui court -> recentrage
+            if (!longFired) {
+                refQr = lastQr; refQi = lastQi; refQj = lastQj; refQk = lastQk;
+                haveRef = true;
+                holdActive = false;   // un recentrage annule le hold
+                LOG_INFO("Recentre !");
+            }
         }
         lastBtn = btn;
+
+        // ---- Choix des angles a envoyer (hold ou live) ----
+        float outPan  = holdActive ? holdPan  : curPan;
+        float outTilt = holdActive ? holdTilt : curTilt;
+
+        // gain + reverse + normalisation
+        outPan  = normalizeAngle(outPan)  * PAN_GAIN  * (PAN_REVERSE  ? -1.0f : 1.0f);
+        outTilt = normalizeAngle(outTilt) * TILT_GAIN * (TILT_REVERSE ? -1.0f : 1.0f);
+
+        panCh  = angleToChannel(outPan);
+        tiltCh = angleToChannel(outTilt);
 
         static uint32_t lastSend = 0;
         if (millis() - lastSend >= 15)
